@@ -134,11 +134,29 @@
     }
     file.text().then(function (text) {
       var parsed = V.parseReport(text);
-      if (parsed.ok) showReport(parsed.report);
-      else showInvalid(parsed.reason);
+      if (parsed.ok) {
+        // Check schema version before showing the report
+        if (parsed.report.schemaVersion !== 1) {
+          showUnsupportedSchemaWarning(parsed.report);
+          return;
+        }
+        showReport(parsed.report);
+      } else {
+        showInvalid(parsed.reason);
+      }
     }, function () {
       showInvalid("the file could not be read");
     });
+  }
+
+  function showUnsupportedSchemaWarning(report) {
+    var banner = el("schema-version-warning");
+    var schemaVersion = report.schemaVersion;
+    var displayVersion = (typeof schemaVersion === "number" || typeof schemaVersion === "string") ?
+      String(schemaVersion) : "unknown";
+    banner.textContent = "Unsupported report schema version " + displayVersion + ". This viewer supports schemaVersion 1. See the upgrade documentation for guidance.";
+    banner.hidden = false;
+    el("result").hidden = true;
   }
 
   function applyTheme(theme) {

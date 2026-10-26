@@ -22,6 +22,7 @@ async fn main() {
         Command::Report(args) => commands::run_report(args),
         Command::Cache(CacheArgs::Clear(args)) => commands::run_cache_clear(args),
         Command::Version => commands::run_version(),
+        Command::FixturePack(args) => commands::run_fixture_pack(args).await,
     };
 
     std::process::exit(exit_code.code());
