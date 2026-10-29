@@ -1,27 +1,33 @@
 //! Command implementations.
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use canary_core::{
     CachePolicy, CacheStore, CanaryError, DefaultPolicyEvaluator, ExecutionContext, ExitCode,
     NetworkContext, Policy, PolicyEvaluator, ProtocolVersion, RunOptions, Surface,
 };
+
+use crate::cli::FixturePackArgs;
 use canary_git::{collect_git_context, CliGitRepository};
 use canary_report::{
-    JUnitReporter, JsonReporter, MarkdownReporter, NetworkSummary, ProjectSummary, ReportInput,
-    TerminalReporter,
+    diff, JUnitReporter, JsonReporter, MarkdownReporter, NetworkSummary, ProjectSummary,
+    ReportInput, TerminalReporter,
 };
 use canary_rpc::{validate_network_info, HttpRpcClient, RetryPolicy, RpcClient, RpcError};
 use canary_runner::{EnabledSurfaces, NetworkMode};
+use clap::CommandFactory;
 
 use crate::cli::{
-    CacheClearArgs, CheckArgs, FixturesArgs, FixturesFormat, InspectArgs, InspectFormat,
-    OutputFormat, ReportArgs,
+    CacheClearArgs, CheckArgs, Cli, CompletionsArgs, ConfigValidateArgs, DiffArgs, FixturesArgs,
+    FixturesFormat, InspectArgs, InspectFormat, LockArgs, LockVerifyArgs, OutputFormat, ReportArgs,
 };
 use crate::error::{hint_for, print_error};
 use crate::fixtures_json;
 use crate::inspect_json;
 use crate::network::{default_rpc_url, parse_network_name, resolve_passphrase};
+
+use canary_config::LockError;
 
 const CACHE_DIR_NAME: &str = ".stellar-canary-cache";
 
@@ -198,6 +204,13 @@ async fn run_check_inner(args: CheckArgs) -> Result<ExitCode, CanaryError> {
         },
     );
     let fixtures_dir = project_root.resolve_input(&settings.fixtures_dir);
+
+    // `--locked` is verified before any fixture loads or runs: a missing
+    // or stale pin must fail the whole run with exit code 2, not surface
+    // after fixtures have already executed (issue #446).
+    if args.locked {
+        verify_locked(&root, &fixtures_dir)?;
+    }
 
     let target_protocol =
         ProtocolVersion(validated_protocol_flag(args.protocol)?.unwrap_or(config.protocol));
@@ -631,15 +644,14 @@ fn inspect_setup(args: &InspectArgs) -> Result<InspectSetup, CanaryError> {
     );
     let fixtures_dir = project_root.resolve_input(&settings.fixtures_dir);
 
-    let details = canary_project::detect_details(&root);
-    let detected = details.context.clone();
     let explicit_type = match config.project.project_type {
         canary_config::ProjectTypeSetting::Auto => None,
         canary_config::ProjectTypeSetting::Explicit(t) => Some(t),
     };
-    let resolved_type = canary_project::resolve_project_type(detected.project_type, explicit_type);
-    let mut project = detected.clone();
-    project.project_type = resolved_type;
+    let details = canary_project::detect_project(&root, explicit_type);
+    let project = details.context.clone();
+    let mut detected = project.clone();
+    detected.project_type = details.detected_type;
 
     let target_source = if args.protocol.is_some() {
         "flag"
@@ -894,6 +906,9 @@ fn run_inspect_json(setup: InspectSetup) -> Result<(), CanaryError> {
                     ecosystem: item.ecosystem.clone(),
                     dependency: item.dependency.clone(),
                     section: item.section.clone(),
+                    source_file: Some(item.source_file.clone()),
+                    matched_text: Some(item.matched_text.clone()),
+                    reason: Some(item.reason.clone()),
                 })
                 .collect(),
         })
@@ -1110,7 +1125,12 @@ fn run_fixtures_inner(args: FixturesArgs) -> Result<ExitCode, CanaryError> {
     } else {
         Vec::new()
     };
-    let store = canary_fixtures::validate(&loaded_fixtures)?;
+    let _store = canary_fixtures::validate(&loaded_fixtures)?;
+
+    let surface_filter: Option<Surface> = args.surface.map(Into::into);
+    let category_filter = args.category.as_deref();
+    let filtered_fixtures =
+        canary_fixtures::filter_fixtures(&loaded_fixtures, surface_filter, category_filter);
 
     let format = if args.json {
         FixturesFormat::Json
@@ -1125,10 +1145,15 @@ fn run_fixtures_inner(args: FixturesArgs) -> Result<ExitCode, CanaryError> {
             let target = canary_core::ProtocolVersion(protocol);
             let mut any = false;
             for surface in canary_report::SURFACE_ORDER {
-                let ids: Vec<&str> = store
-                    .for_protocol(target)
-                    .filter(|f| f.surface == surface)
-                    .map(|f| f.id.as_str())
+                if let Some(expected) = surface_filter {
+                    if surface != expected {
+                        continue;
+                    }
+                }
+                let ids: Vec<&str> = filtered_fixtures
+                    .iter()
+                    .filter(|f| f.metadata.protocol == target && f.metadata.surface == surface)
+                    .map(|f| f.metadata.id.as_str())
                     .collect();
                 if ids.is_empty() {
                     continue;
@@ -1150,7 +1175,7 @@ fn run_fixtures_inner(args: FixturesArgs) -> Result<ExitCode, CanaryError> {
                 protocol,
                 fixtures_dir.is_dir(),
                 &fixtures_dir,
-                &loaded_fixtures,
+                &filtered_fixtures,
             );
             print!("{}", fixtures_json::render(&inventory));
         }
@@ -1239,9 +1264,383 @@ fn run_report_inner(args: ReportArgs) -> Result<ExitCode, CanaryError> {
     Ok(exit_code)
 }
 
+/// Exit codes for `stellar-canary diff` (CF-05 section 5).
+///
+/// `diff` gates CI on the same numeric contract as every other command —
+/// CF-05 states its codes "mirror the existing meanings of `1` and `2`"
+/// — read through the comparison's lens: [`ExitCode::Pass`] (0) for
+/// verdict `no-change` or `improved`, [`ExitCode::CompatibilityFailure`]
+/// (1) for verdict `regression` or `coverage-lost`, and
+/// [`ExitCode::ConfigurationError`] (2) when the two reports are not
+/// comparable or an input file is missing or invalid. Callers of `diff`
+/// must be able to rely on *those* numbers.
+struct DiffCommandError {
+    exit_code: ExitCode,
+    message: String,
+}
+
+impl DiffCommandError {
+    fn new(exit_code: ExitCode, message: impl Into<String>) -> Self {
+        DiffCommandError {
+            exit_code,
+            message: message.into(),
+        }
+    }
+}
+
+/// Compares two stored reports (CF-05) and returns the process exit code
+/// through the shared [`ExitCode`] contract.
+pub fn run_diff(args: DiffArgs) -> ExitCode {
+    match run_diff_inner(args) {
+        Ok(exit_code) => exit_code,
+        Err(err) => {
+            eprintln!("error: {}", err.message);
+            err.exit_code
+        }
+    }
+}
+
+fn run_diff_inner(args: DiffArgs) -> Result<ExitCode, DiffCommandError> {
+    let read = |path: &Path| -> Result<String, DiffCommandError> {
+        std::fs::read_to_string(path).map_err(|e| {
+            DiffCommandError::new(
+                ExitCode::ConfigurationError,
+                format!("failed to read report file {}: {e}", path.display()),
+            )
+        })
+    };
+
+    let current = read(&args.current_report)?;
+    let baseline = read(&args.baseline_report)?;
+
+    // Eligibility (a supported schemaVersion on both sides, the same
+    // targetProtocol, no duplicate identities) is checked here and
+    // refuses with exit code 2 — never a bogus "diff" full of
+    // cross-protocol noise.
+    let comparison = diff::compare_json(&baseline, &current, diff::CompareOptions::default())
+        .map_err(|err| DiffCommandError::new(ExitCode::ConfigurationError, err.to_string()))?;
+
+    // The diffVersion 1 JSON goes to stdout regardless of the verdict,
+    // mirroring `check --json`: CI consumes stdout, gating on the exit
+    // code.
+    println!("{}", comparison.to_json());
+
+    Ok(match comparison.verdict {
+        diff::Verdict::Regression | diff::Verdict::CoverageLost => ExitCode::CompatibilityFailure,
+        diff::Verdict::Improved | diff::Verdict::NoChange => ExitCode::Pass,
+    })
+}
+
+pub fn run_lock(args: LockArgs) -> ExitCode {
+    match run_lock_inner(args) {
+        Ok(exit_code) => exit_code,
+        Err(err) => {
+            eprintln!("error: {err}");
+            ExitCode::from(&err)
+        }
+    }
+}
+
+fn run_lock_inner(args: LockArgs) -> Result<ExitCode, CanaryError> {
+    let root = std::env::current_dir()
+        .map_err(|e| CanaryError::Internal(format!("failed to read current directory: {e}")))?;
+
+    let config = match &args.config {
+        Some(path) => canary_config::load(path)?,
+        None => canary_config::load_from_root(&root)?.unwrap_or_default(),
+    };
+    let protocol = validated_protocol_flag(args.protocol)?.unwrap_or(config.protocol);
+
+    // Fully resolve and validate the fixture pack *before* touching the
+    // lockfile: an unreachable or invalid fixture directory must report
+    // a clear error without leaving a partial lockfile behind.
+    if !args.fixtures_dir.is_dir() {
+        return Err(CanaryError::Configuration(format!(
+            "fixtures directory {} does not exist or is not a directory",
+            args.fixtures_dir.display()
+        )));
+    }
+    let loaded_fixtures = canary_fixtures::load_directory(&args.fixtures_dir)?;
+    canary_fixtures::validate(&loaded_fixtures)?;
+    let digest = canary_fixtures::pack_digest(&args.fixtures_dir).map_err(|e| {
+        CanaryError::Configuration(format!("failed to digest the fixture pack: {e}"))
+    })?;
+
+    let lockfile = canary_config::LockFile {
+        lock_version: canary_config::SUPPORTED_LOCK_VERSION,
+        tool: Some(canary_config::LockTool {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+        }),
+        fixtures: canary_config::LockFixtures {
+            protocol,
+            pack_digest: digest.digest,
+            registry_version: canary_config::SUPPORTED_REGISTRY_VERSION,
+            source: Some(canary_config::LockSource::Directory),
+            revision: None,
+        },
+    };
+    let path = root.join(canary_config::LOCK_FILE_NAME);
+    canary_config::write_lock(&path, &lockfile)?;
+
+    println!(
+        "Wrote {} (lockVersion {}, protocol {}, packDigest {})",
+        path.display(),
+        lockfile.lock_version,
+        lockfile.fixtures.protocol,
+        lockfile.fixtures.pack_digest
+    );
+
+    Ok(ExitCode::Pass)
+}
+
 pub fn run_version() -> ExitCode {
     println!("stellar-canary {}", env!("CARGO_PKG_VERSION"));
     ExitCode::Pass
+}
+
+/// Verifies a fixture pack directory against its registry-v1.json manifest.
+///
+/// Computes the CF-02 canonical pack digest and verifies that all fixture
+/// files match their SHA-256 hashes recorded in the registry. Exits 0 on
+/// success, 1 on any verification failure.
+///
+/// # Errors
+///
+/// Returns an [`ExitCode`] rather than a `Result`. Any error encountered
+/// during verification is printed to stderr and mapped to an appropriate
+/// exit code:
+/// - [`ExitCode::ConfigurationError`] if the pack path does not exist,
+///   the registry manifest is missing or invalid, or the pack is malformed.
+/// - [`ExitCode::VerificationFailure`] if any file checksum or the pack
+///   digest does not match the registry.
+pub async fn run_fixture_pack(args: FixturePackArgs) -> ExitCode {
+    match run_fixture_pack_inner(args).await {
+        Ok(exit_code) => exit_code,
+        Err(err) => {
+            print_error(&err);
+            ExitCode::from(&err)
+        }
+    }
+}
+
+async fn run_fixture_pack_inner(args: FixturePackArgs) -> Result<ExitCode, CanaryError> {
+    use canary_fixtures::digest::{pack_digest, sha256_hex, PackError};
+    use serde::Deserialize;
+
+    let FixturePackArgs::Verify(verify_args) = args;
+    let pack_path = verify_args.path;
+    let registry_path_opt = verify_args.registry;
+
+    // Verify the pack path exists and is a directory
+    let pack_meta = std::fs::metadata(&pack_path).map_err(|e| {
+        CanaryError::Configuration(format!(
+            "failed to read pack path {}: {e}",
+            pack_path.display()
+        ))
+    })?;
+    if !pack_meta.is_dir() {
+        return Err(CanaryError::Configuration(format!(
+            "pack path {} is not a directory",
+            pack_path.display()
+        )));
+    }
+
+    // Load the registry manifest
+    let registry_path = registry_path_opt.unwrap_or_else(|| pack_path.join("registry.json"));
+
+    let registry_bytes = std::fs::read(&registry_path).map_err(|e| {
+        CanaryError::Configuration(format!(
+            "failed to read registry manifest {}: {e}",
+            registry_path.display()
+        ))
+    })?;
+
+    // Parse the registry manifest
+    #[derive(Deserialize)]
+    struct RegistryFixture {
+        #[allow(dead_code)]
+        id: String,
+        path: String,
+        sha256: String,
+        #[serde(default)]
+        payloads: Vec<PayloadEntry>,
+    }
+
+    #[derive(Deserialize)]
+    struct PayloadEntry {
+        path: String,
+        sha256: String,
+    }
+
+    #[derive(Deserialize)]
+    struct RegistryManifest {
+        registry_version: u32,
+        protocol: u32,
+        fixtures: Vec<RegistryFixture>,
+        pack_digest: String,
+    }
+
+    let registry: RegistryManifest = serde_json::from_slice(&registry_bytes).map_err(|e| {
+        CanaryError::Configuration(format!(
+            "failed to parse registry manifest {}: {e}",
+            registry_path.display()
+        ))
+    })?;
+
+    if registry.registry_version != 1 {
+        return Err(CanaryError::Configuration(format!(
+            "unsupported registry version: expected 1, got {}",
+            registry.registry_version
+        )));
+    }
+
+    // Compute the pack digest
+    let pack_digest_result = pack_digest(&pack_path).map_err(|e| match e {
+        PackError::Io { path, source } => CanaryError::Configuration(format!(
+            "failed to read pack file {}: {source}",
+            path.display()
+        )),
+        PackError::SymbolicLink { path } => {
+            CanaryError::Configuration(format!("pack contains a symbolic link: {}", path.display()))
+        }
+        PackError::InvalidPath { path, reason } => {
+            CanaryError::Configuration(format!("invalid pack path {}: {reason}", path))
+        }
+        PackError::CaseCollision { first, second } => CanaryError::Configuration(format!(
+            "pack paths {} and {} differ only by letter case",
+            first, second
+        )),
+        PackError::BadReference {
+            file,
+            field,
+            reference,
+            reason,
+        } => CanaryError::Configuration(format!(
+            "{file}: {field} {reference:?} is not usable: {reason}"
+        )),
+        PackError::InvalidToml { file, message } => {
+            CanaryError::Configuration(format!("{file} is not valid TOML: {message}"))
+        }
+        PackError::Limit(msg) => CanaryError::Configuration(format!("pack limit exceeded: {msg}")),
+    })?;
+
+    // Verify pack digest matches registry
+    if pack_digest_result.digest != registry.pack_digest {
+        eprintln!(
+            "error: pack digest mismatch\n  computed: {}\n  expected: {}",
+            pack_digest_result.digest, registry.pack_digest
+        );
+        return Ok(ExitCode::VerificationFailure);
+    }
+
+    // Build a map of file paths to their expected SHA-256 hashes from the registry
+    let mut expected_hashes: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+
+    for fixture in &registry.fixtures {
+        // Verify fixture file exists and matches its hash
+        let fixture_abs_path = pack_path.join(&fixture.path);
+        let fixture_meta = std::fs::symlink_metadata(&fixture_abs_path).map_err(|e| {
+            CanaryError::Configuration(format!(
+                "failed to read fixture file {}: {e}",
+                fixture_abs_path.display()
+            ))
+        })?;
+
+        if !fixture_meta.is_file() {
+            eprintln!(
+                "error: fixture file not found: {}",
+                fixture_abs_path.display()
+            );
+            return Ok(ExitCode::VerificationFailure);
+        }
+
+        let fixture_bytes = std::fs::read(&fixture_abs_path).map_err(|e| {
+            CanaryError::Configuration(format!(
+                "failed to read fixture file {}: {e}",
+                fixture_abs_path.display()
+            ))
+        })?;
+
+        let actual_hash = sha256_hex(&fixture_bytes);
+        if actual_hash != fixture.sha256 {
+            eprintln!(
+                "error: fixture checksum mismatch for {}\n  computed: {}\n  expected: {}",
+                fixture.path, actual_hash, fixture.sha256
+            );
+            return Ok(ExitCode::VerificationFailure);
+        }
+
+        expected_hashes.insert(fixture.path.clone(), fixture.sha256.clone());
+
+        // Verify payload files
+        for payload in &fixture.payloads {
+            let payload_abs_path = pack_path.join(&payload.path);
+            let payload_meta = std::fs::symlink_metadata(&payload_abs_path).map_err(|e| {
+                CanaryError::Configuration(format!(
+                    "failed to read payload file {}: {e}",
+                    payload_abs_path.display()
+                ))
+            })?;
+
+            if !payload_meta.is_file() {
+                eprintln!(
+                    "error: payload file not found: {}",
+                    payload_abs_path.display()
+                );
+                return Ok(ExitCode::VerificationFailure);
+            }
+
+            let payload_bytes = std::fs::read(&payload_abs_path).map_err(|e| {
+                CanaryError::Configuration(format!(
+                    "failed to read payload file {}: {e}",
+                    payload_abs_path.display()
+                ))
+            })?;
+
+            let payload_hash = sha256_hex(&payload_bytes);
+            if payload_hash != payload.sha256 {
+                eprintln!(
+                    "error: payload checksum mismatch for {}\n  computed: {}\n  expected: {}",
+                    payload.path, payload_hash, payload.sha256
+                );
+                return Ok(ExitCode::VerificationFailure);
+            }
+
+            expected_hashes.insert(payload.path.clone(), payload.sha256.clone());
+        }
+    }
+
+    // Verify that all files in the pack digest are accounted for in the registry
+    for pack_file in &pack_digest_result.files {
+        if !expected_hashes.contains_key(&pack_file.path) {
+            eprintln!(
+                "error: file in pack digest not found in registry: {}",
+                pack_file.path
+            );
+            return Ok(ExitCode::VerificationFailure);
+        }
+        if expected_hashes.get(&pack_file.path).unwrap() != &pack_file.sha256 {
+            eprintln!(
+                "error: file hash mismatch in pack digest for {}\n  computed: {}\n  expected: {}",
+                pack_file.path,
+                pack_file.sha256,
+                expected_hashes.get(&pack_file.path).unwrap()
+            );
+            return Ok(ExitCode::VerificationFailure);
+        }
+    }
+
+    // Success
+    println!("Fixture pack verification passed:");
+    println!("  Protocol: {}", registry.protocol);
+    println!("  Registry version: {}", registry.registry_version);
+    println!("  Pack digest: {}", registry.pack_digest);
+    println!("  Fixtures verified: {}", registry.fixtures.len());
+    println!("  All file checksums match registry.");
+    println!("  Pack digest matches registry.");
+
+    Ok(ExitCode::Pass)
 }
 
 /// Deletes every cached fixture execution result under the cache directory
@@ -1289,6 +1688,407 @@ fn run_cache_clear_inner(args: CacheClearArgs) -> Result<ExitCode, CanaryError> 
     Ok(ExitCode::Pass)
 }
 
+/// Enforces the `.stellar-canary.lock` pin for `check --locked` (CF-03).
+///
+/// With `--locked`, the lockfile must exist next to the configuration in
+/// the project root, must parse under the CF-03 section 3 rules, and its
+/// pinned `[fixtures].packDigest` must equal the `canary-pack-v1` digest
+/// (CF-02) of the resolved fixture pack. Every deviation — a missing
+/// lockfile, an unreadable one, an undigestible pack, or a pack whose
+/// bytes no longer hash to the pinned digest — is a configuration error:
+/// the run exits with code 2 before any fixture executes, and the message
+/// names `stellar-canary lock` as the command that repairs the pin. This
+/// is deliberately stricter than `lock verify`, which reports the same
+/// conditions as a verification failure with exit code 1: `--locked` is a
+/// CI gate, and a gate that cannot tell "the pin does not hold" apart from
+/// "the pin was never set" is a gate that invites `|| true`.
+fn verify_locked(root: &Path, fixtures_dir: &Path) -> Result<(), CanaryError> {
+    let lock_path = root.join(canary_config::LOCK_FILE_NAME);
+    let lock = canary_config::load_lock(&lock_path).map_err(|err| match err {
+        LockError::Read { path, source } if source.kind() == std::io::ErrorKind::NotFound => {
+            CanaryError::Configuration(format!(
+                "--locked requires {}, but no lockfile exists: run 'stellar-canary lock' to pin the fixture pack",
+                path.display()
+            ))
+        }
+        other => CanaryError::Configuration(format!(
+            "--locked could not load the lockfile {}: {other}; run 'stellar-canary lock' to rewrite the pin",
+            lock_path.display()
+        )),
+    })?;
+
+    let pack = canary_fixtures::pack_digest(fixtures_dir).map_err(|e| {
+        CanaryError::Configuration(format!(
+            "--locked could not digest the fixture pack at {}: {e}; restore the fixture pack, then run 'stellar-canary lock' to re-pin it",
+            fixtures_dir.display()
+        ))
+    })?;
+
+    if lock.fixtures.pack_digest != pack.digest {
+        return Err(CanaryError::Configuration(format!(
+            "--locked: the lockfile pins fixtures.packDigest {}, but the fixture pack at {} hashes to {}: run 'stellar-canary lock' to update the pin",
+            lock.fixtures.pack_digest,
+            fixtures_dir.display(),
+            pack.digest
+        )));
+    }
+    Ok(())
+}
+
+/// What `lock verify` decided (CF-03-D).
+///
+/// The distinction only shapes the message and which stream it goes to:
+/// every result that leaves the run is an `ExitCode::Pass` or an
+/// `ExitCode::CompatibilityFailure`. Argument and configuration problems
+/// (a missing project root, an unreadable configuration file) never reach
+/// this type — they are `CanaryError`s, which keep exit code 2.
+enum LockVerifyOutcome {
+    /// The lockfile parses under CF-03 section 3 and `packDigest` matches
+    /// the computed `canary-pack-v1` digest (CF-02) of the resolved pack.
+    Verified(String),
+    /// The lockfile is absent, unreadable, not a valid CF-03 lock, or the
+    /// pack digest differs. All of these are the "the pin does not hold"
+    /// outcome, and none of them is repaired by the command.
+    Unverified(String),
+}
+
+/// Verifies that the project's lockfile still matches the fixture pack
+/// (CF-03-D).
+///
+/// The command is deliberately small and read-only: it resolves
+/// `fixtures_dir` like every other command (the flag, then
+/// `.stellar-canary.toml`, then the default), loads `.stellar-canary.lock`
+/// under the CF-03 section 3 parser rules, computes the fixture pack's
+/// digest, and compares. It writes no file, touches no cache and opens no
+/// network socket.
+///
+/// Exit codes: `0` when the pin holds, `1` when it does not (absent lock,
+/// parser failure, changed pack — verification failed, so the CI answer the
+/// caller asked for is "no"), and `2` when verification could not start
+/// because the invocation itself does not resolve (bad `--project-root`,
+/// unreadable configuration file).
+pub fn run_lock_verify(args: LockVerifyArgs) -> ExitCode {
+    let outcome = match run_lock_verify_inner(&args) {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            print_error(&err);
+            return ExitCode::from(&err);
+        }
+    };
+    match outcome {
+        LockVerifyOutcome::Verified(message) => {
+            println!("{message}");
+            ExitCode::Pass
+        }
+        LockVerifyOutcome::Unverified(message) => {
+            eprintln!("error: {message}");
+            ExitCode::CompatibilityFailure
+        }
+    }
+}
+
+fn run_lock_verify_inner(args: &LockVerifyArgs) -> Result<LockVerifyOutcome, CanaryError> {
+    let project_root = ProjectRoot::resolve(args.project_root.as_deref())?;
+    let root = project_root.path.clone();
+
+    let config = match &args.config {
+        Some(path) => canary_config::load(&project_root.resolve_input(path))?,
+        None => canary_config::load_from_root(&root)?.unwrap_or_default(),
+    };
+    // Highest to lowest: flag, configuration file, built-in default
+    // (`fixtures`, issue #474). Overriding the location does not waive the
+    // pin — the chosen directory is still verified (CF-03 section 4).
+    let settings = canary_config::resolve_settings(
+        &config,
+        canary_config::CliOverrides {
+            fixtures_dir: args.fixtures_dir.clone(),
+            ..canary_config::CliOverrides::default()
+        },
+    );
+    let fixtures_dir = project_root.resolve_input(&settings.fixtures_dir);
+
+    let lock_path = root.join(canary_config::LOCK_FILE_NAME);
+    let lock = match canary_config::load_lock(&lock_path) {
+        Ok(lock) => lock,
+        Err(LockError::Read { path, source }) if source.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(LockVerifyOutcome::Unverified(format!(
+                "no lockfile at {}: nothing is pinned, so there is nothing to verify",
+                path.display()
+            )));
+        }
+        Err(err) => return Ok(LockVerifyOutcome::Unverified(err.to_string())),
+    };
+
+    let pack = match canary_fixtures::pack_digest(&fixtures_dir) {
+        Ok(pack) => pack,
+        // A pack that cannot be digested (unreadable directory, a broken
+        // TOML file, a symbolic link) cannot be identified either, so the
+        // pin does not hold and verification fails (exit 1), like every
+        // other verification outcome.
+        Err(err) => {
+            return Ok(LockVerifyOutcome::Unverified(format!(
+                "the fixture pack at {} could not be verified: {err}",
+                fixtures_dir.display()
+            )));
+        }
+    };
+
+    lock_stale_message(&lock, &pack.digest).map_or_else(
+        || {
+            Ok(LockVerifyOutcome::Verified(format!(
+                "Verified: {} matches the fixture pack at {} (fixtures.packDigest {}, protocol {}).",
+                lock_path.display(),
+                fixtures_dir.display(),
+                lock.fixtures.pack_digest,
+                lock.fixtures.protocol
+            )))
+        },
+        |message| Ok(LockVerifyOutcome::Unverified(message)),
+    )
+}
+
+/// The "the pin does not hold" message for a lock whose `packDigest`
+/// differs from the computed one, or `None` when they agree.
+///
+/// Kept pure so the exact wording is pinned by unit tests in this file.
+fn lock_stale_message(lock: &canary_config::LockFile, computed: &str) -> Option<String> {
+    let pinned = &lock.fixtures.pack_digest;
+    if pinned == computed {
+        return None;
+    }
+    Some(format!(
+        "the lockfile pins fixtures.packDigest {pinned}, but the fixture pack hashes to {computed} (protocol {}): the pack must be re-locked before it is trusted",
+        lock.fixtures.protocol
+    ))
+}
+
+/// What `config validate` came back with (issue #457).
+///
+/// The variants differ in the message, the stream it goes to and the exit
+/// code, and they are exhaustive about the three situations the command can
+/// meet: a file that is valid, a file that is not, and no file to validate
+/// at the default location. A fourth covers the invocation itself failing
+/// before any file was read.
+enum ConfigValidation {
+    /// The file parsed and passed every loader rule. Carries the settings
+    /// report, which goes to stdout.
+    Valid(String),
+    /// No `.stellar-canary.toml` exists at the project root. This is not an
+    /// invalid configuration: a project with no configuration file runs on
+    /// the built-in defaults, and the defaults are a valid configuration.
+    /// Carries the path that was looked for.
+    NoFile(PathBuf),
+    /// The file exists but is not a valid configuration: a TOML syntax
+    /// error, an unknown table or key (which is how a misspelled `[tests]`
+    /// presents), a value of the wrong type, an unsupported `version`, or a
+    /// rule the loader enforces after parsing. The message is the loader's
+    /// own diagnostic, so it names the offending field and — for anything
+    /// the parser rejected — the line and column it was found at.
+    Invalid(String),
+    /// Validation never started, because the invocation does not resolve
+    /// (`--project-root` is not a directory) or the named file cannot be
+    /// read. These are the caller's problem rather than the project's, so
+    /// they keep the configuration-error exit code.
+    Blocked(CanaryError),
+}
+
+/// Validates `.stellar-canary.toml` without running any check (issue #457).
+///
+/// The command reads one file and stops: it loads no fixture, executes no
+/// check, opens no socket and writes nothing. It parses with
+/// [`canary_config::parse_config`], the strict loader `check` uses, so the
+/// answer is exactly what a run would have concluded about the same bytes —
+/// unknown tables and keys rejected, types checked, and the `version`,
+/// `protocol` and surface rules enforced.
+///
+/// Exit codes follow the shared contract, read through the question the
+/// caller asked ("is my configuration valid?"): `0` when the file is valid
+/// (and when there is no file, since the defaults are valid), `1` when the
+/// file is not a valid configuration — that is the answer "no", the same
+/// reading as `lock verify` gives a pin that does not hold — and `2` when
+/// validation could not start because the invocation itself does not
+/// resolve or the file named by `--config` cannot be read.
+pub fn run_config_validate(args: ConfigValidateArgs) -> ExitCode {
+    match validate_project_config(args) {
+        ConfigValidation::Valid(report) => {
+            println!("{report}");
+            ExitCode::Pass
+        }
+        ConfigValidation::NoFile(path) => {
+            println!(
+                "No configuration file at {}: the project runs on the built-in defaults, which are valid.",
+                path.display()
+            );
+            ExitCode::Pass
+        }
+        ConfigValidation::Invalid(message) => {
+            eprintln!("error: {message}");
+            ExitCode::CompatibilityFailure
+        }
+        ConfigValidation::Blocked(err) => {
+            print_error(&err);
+            ExitCode::from(&err)
+        }
+    }
+}
+
+/// Reads and validates the configuration file `args` points at.
+///
+/// Split out from [`run_config_validate`] so the outcome is testable
+/// without capturing stdout, and so the exit-code mapping above is the
+/// only place the four outcomes turn into numbers.
+fn validate_project_config(args: ConfigValidateArgs) -> ConfigValidation {
+    let project_root = match ProjectRoot::resolve(args.project_root.as_deref()) {
+        Ok(root) => root,
+        Err(err) => return ConfigValidation::Blocked(err),
+    };
+
+    let (path, raw) = match &args.config {
+        // An explicitly named file must exist: the caller pointed at it, so
+        // a missing one is a broken invocation rather than a project with
+        // no configuration (which is the `None` branch below).
+        Some(explicit) => {
+            let path = project_root.resolve_input(explicit);
+            match std::fs::read_to_string(&path) {
+                Ok(raw) => (path, raw),
+                Err(err) => {
+                    return ConfigValidation::Blocked(read_config_error(&path, err));
+                }
+            }
+        }
+        None => {
+            let path = project_root.path.join(canary_config::CONFIG_FILE_NAME);
+            match std::fs::read_to_string(&path) {
+                Ok(raw) => (path, raw),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    return ConfigValidation::NoFile(path);
+                }
+                Err(err) => return ConfigValidation::Blocked(read_config_error(&path, err)),
+            }
+        }
+    };
+
+    match canary_config::parse_config(&raw, &path) {
+        Ok(config) => ConfigValidation::Valid(settings_report(&config, &path)),
+        Err(err) => ConfigValidation::Invalid(err.to_string()),
+    }
+}
+
+/// The "could not start" diagnostic for a configuration file that is there
+/// but unreadable, worded the way [`canary_config::load`] words its own
+/// read failure so every command reports one cause the same way.
+fn read_config_error(path: &Path, err: std::io::Error) -> CanaryError {
+    CanaryError::Configuration(format!(
+        "failed to read configuration file {}: {err}",
+        path.display()
+    ))
+}
+
+/// The "here is what this configuration says" report for a valid file.
+///
+/// One line per setting the loader understands, in the file's own key names,
+/// showing the value the file gives and — for the three optional run
+/// settings — the default that applies when the file leaves them unset.
+/// Deterministic and order-fixed, so the output is usable in a CI log.
+fn settings_report(config: &canary_config::ConfigFile, path: &Path) -> String {
+    let setting = |key: &str, value: String| format!("  {key:<28} = {value}");
+
+    let surfaces = [
+        ("xdr", config.tests.xdr),
+        ("rpc", config.tests.rpc),
+        ("soroban", config.tests.soroban),
+    ]
+    .map(|(name, enabled)| format!("{name}={enabled}"))
+    .join(" ");
+
+    let project_type = match config.project.project_type {
+        canary_config::ProjectTypeSetting::Auto => "auto".to_string(),
+        canary_config::ProjectTypeSetting::Explicit(kind) => kind.to_string(),
+    };
+
+    let lines = [
+        format!("Valid: {}", path.display()),
+        setting("version", config.version.to_string()),
+        setting("protocol", config.protocol.to_string()),
+        setting(
+            "network",
+            config.network.clone().unwrap_or_else(|| {
+                format!("(not set: defaults to {})", canary_config::DEFAULT_NETWORK)
+            }),
+        ),
+        setting(
+            "rpc_url",
+            config
+                .rpc_url
+                .clone()
+                .unwrap_or_else(|| "(not set)".to_string()),
+        ),
+        setting(
+            "fixtures_dir",
+            config.fixtures_dir.clone().map_or_else(
+                || {
+                    format!(
+                        "(not set: defaults to {})",
+                        canary_config::DEFAULT_FIXTURES_DIR
+                    )
+                },
+                |dir| dir.display().to_string(),
+            ),
+        ),
+        setting("project.type", project_type),
+        setting("tests", surfaces),
+        setting(
+            "policy.warnings_are_failures",
+            config.policy.warnings_are_failures.to_string(),
+        ),
+    ];
+
+    lines.join("\n")
+}
+
+/// Generates a shell completion script for `stellar-canary` and writes it
+/// to stdout.
+///
+/// The script is produced from the same [`Cli`] command definition the
+/// binary parses with (`Cli::command()`), so it describes the actual
+/// command tree — every subcommand, option and flag this build accepts —
+/// without duplicating any of it. The shell itself was already validated
+/// by clap during argument parsing: an unsupported name exits with a usage
+/// error on stderr (exit status 2) before this runs, so stdout carries only
+/// the script and stays usable as a completion-script file. A failure to
+/// write the script is the one error this command can produce at run time;
+/// it is reported on stderr like every other command error.
+pub fn run_completions(args: CompletionsArgs) -> ExitCode {
+    match run_completions_inner(args) {
+        Ok(exit_code) => exit_code,
+        Err(err) => {
+            eprintln!("error: {err}");
+            ExitCode::from(&err)
+        }
+    }
+}
+
+fn run_completions_inner(args: CompletionsArgs) -> Result<ExitCode, CanaryError> {
+    let shell = clap_complete::Shell::from(args.shell);
+    let mut command = Cli::command();
+    let bin_name = command.get_name().to_string();
+
+    let mut script = Vec::new();
+    clap_complete::generate(shell, &mut command, bin_name, &mut script);
+
+    let stdout = std::io::stdout();
+    let mut handle = stdout.lock();
+    handle
+        .write_all(&script)
+        .and_then(|()| handle.flush())
+        .map_err(|err| {
+            CanaryError::Internal(format!(
+                "failed to write the completion script to stdout: {err}"
+            ))
+        })?;
+    Ok(ExitCode::Pass)
+}
+
 /// Formats a byte count in a human-readable form (B, KiB, MiB, ...).
 fn format_bytes(bytes: u64) -> String {
     const UNITS: &[&str] = &["B", "KiB", "MiB", "GiB", "TiB"];
@@ -1316,6 +2116,39 @@ mod tests {
     };
     use std::path::PathBuf;
 
+    fn lock_with_digest(digest: &str) -> canary_config::LockFile {
+        canary_config::LockFile {
+            lock_version: 1,
+            tool: None,
+            fixtures: canary_config::LockFixtures {
+                protocol: 28,
+                pack_digest: digest.to_string(),
+                registry_version: 1,
+                source: None,
+                revision: None,
+            },
+        }
+    }
+
+    #[test]
+    fn a_matching_pin_is_not_stale() {
+        let pin = "sha256:5f1d2c0dcc5be904ed88b0f08d9c1f8db4d1d33d5e51b0a42dfe34e0e2e9f9a1";
+        let lock = lock_with_digest(pin);
+        assert!(lock_stale_message(&lock, pin).is_none());
+    }
+
+    #[test]
+    fn a_changed_pack_names_both_digests_and_the_protocol() {
+        let lock = lock_with_digest(
+            "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        );
+        let computed = "sha256:2222222222222222222222222222222222222222222222222222222222222222";
+        let message = lock_stale_message(&lock, computed).expect("stale");
+        assert!(message.contains(&lock.fixtures.pack_digest), "{message}");
+        assert!(message.contains(computed), "{message}");
+        assert!(message.contains("protocol 28"), "{message}");
+    }
+
     fn fixtures_args(
         protocol: Option<u32>,
         fixtures_dir: &str,
@@ -1328,6 +2161,8 @@ mod tests {
             config: config.map(PathBuf::from),
             format: crate::cli::FixturesFormat::Terminal,
             json: false,
+            surface: None,
+            category: None,
         }
     }
 
